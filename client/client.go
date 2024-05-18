@@ -36,6 +36,8 @@ import (
 	_ "strconv"
 )
 
+var LEASTBYTE = 10
+
 // This serves two purposes: it shows you a few useful primitives,
 // and suppresses warnings for imports not being used. It can be
 // safely deleted!
@@ -219,23 +221,10 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 	// PKEDecKey, ok := userlib.KeystoreGet(filename + userdata.Username)
 	var file File
 	if ok {
-		DSVerifyKey, ok := userlib.KeystoreGet(userdata.Username + "sign")
-		if !ok {
-			return errors.New(strings.ToTitle("verify key not found"))
-		}
-		// check signature
-		signature := signed_content[len(signed_content)-256:]
-		encrypted_content := signed_content[:len(signed_content)-256]
-		err = userlib.DSVerify(DSVerifyKey, encrypted_content, signature)
-		if err != nil {
-			return errors.New(strings.ToTitle("signature incorrect"))
-		}
-		// rsa key pair
-		plaintext, err := userlib.PKEDec(userdata.PKEDecKey, encrypted_content)
+		err = userdata.PKDecodeFile(signed_content, &file)
 		if err != nil {
 			return err
 		}
-		json.Unmarshal(plaintext, &file)
 		file.Cur = 0
 		file.Isfile = true
 	} else {
@@ -244,28 +233,164 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		file.Symkey = Contentkey
 		file.Isfile = true
 	}
-	iv := userlib.RandomBytes(16)
-	encrypted_content := userlib.SymEnc(file.Symkey, iv, content)
-	signature, err := userlib.DSSign(userdata.DSSignKey, encrypted_content)
+
+	signed_content, err = userdata.SYMSignContent(content, file.Symkey)
 	if err != nil {
 		return err
 	}
-	signed_content = append(encrypted_content, signature...)
+
 	indexKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username + strconv.Itoa(file.Cur)))[:16])
 	if err != nil {
 		return err
 	}
 	userlib.DatastoreSet(indexKey, signed_content)
-	if len(content) > 256 {
+
+	if len(content) > LEASTBYTE {
 		file.Cur++
 		file.Isfile = false
 	}
+	signed_file, err := userdata.PKSignFile(file)
+	if err != nil {
+		return err
+	}
+	userlib.DatastoreSet(storageKey, signed_file)
 	return nil
 }
+func (userdata *User) SYMDecodeContent(signed_content []byte, key []byte) (plain_content_content []byte, err error) {
+	DSVerifyKey, ok := userlib.KeystoreGet(userdata.Username + "DS")
+	if !ok {
+		return nil, errors.New(strings.ToTitle("verify key not found"))
+	}
+	signature := signed_content[len(signed_content)-256:]
+	encrypted_content := signed_content[:len(signed_content)-256]
+	err = userlib.DSVerify(DSVerifyKey, encrypted_content, signature)
+	if err != nil {
+		return nil, errors.New(strings.ToTitle("signature incorrect"))
+	}
+	plain_content := userlib.SymDec(key, encrypted_content)
+	return plain_content, nil
+}
 
-func (userdata *User) AppendToFile(filename string, content []byte) error {
-
+func (userdata *User) SYMSignContent(plain_file []byte, key []byte) (signed_content []byte, err error) {
+	iv := userlib.RandomBytes(16)
+	encrypted_content := userlib.SymEnc(key, iv, plain_file)
+	signature, err := userlib.DSSign(userdata.DSSignKey, encrypted_content)
+	if err != nil {
+		return nil, err
+	}
+	signed_content = append(encrypted_content, signature...)
+	return signed_content, nil
+}
+func (userdata *User) PKSignFile(file File) (signed_file []byte, err error) {
+	plain_file, err := json.Marshal(file)
+	if err != nil {
+		return nil, err
+	}
+	PKEEncKey, ok := userlib.KeystoreGet(userdata.Username + "PKE")
+	if !ok {
+		return nil, errors.New(strings.ToTitle("encrypt key not found"))
+	}
+	encrypted_file, err := userlib.PKEEnc(PKEEncKey, plain_file)
+	if err != nil {
+		return nil, err
+	}
+	signature, err := userlib.DSSign(userdata.DSSignKey, encrypted_file)
+	if err != nil {
+		return nil, err
+	}
+	signed_file = append(encrypted_file, signature...)
+	return signed_file, nil
+}
+func (userdata *User) PKDecodeFile(signed_content []byte, file *File) (err error) {
+	DSVerifyKey, ok := userlib.KeystoreGet(userdata.Username + "DS")
+	if !ok {
+		return errors.New(strings.ToTitle("verify key not found"))
+	}
+	// check signature
+	signature := signed_content[len(signed_content)-256:]
+	encrypted_content := signed_content[:len(signed_content)-256]
+	err = userlib.DSVerify(DSVerifyKey, encrypted_content, signature)
+	if err != nil {
+		return errors.New(strings.ToTitle("signature incorrect"))
+	}
+	// rsa key pair
+	plaintext, err := userlib.PKEDec(userdata.PKEDecKey, encrypted_content)
+	if err != nil {
+		return err
+	}
+	err = json.Unmarshal(plaintext, file)
+	if err != nil {
+		return err
+	}
 	return nil
+}
+func (userdata *User) AppendToFile(filename string, content []byte) error {
+	storageKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
+	if err != nil {
+		return err
+	}
+	signed_content, ok := userlib.DatastoreGet(storageKey)
+	var file File
+	if !ok {
+		return errors.New(strings.ToTitle("file not found"))
+	}
+	if len(content) == 0 {
+		return nil
+	}
+	// rsa key pair
+	err = userdata.PKDecodeFile(signed_content, &file)
+	if err != nil {
+		return err
+	}
+	// 还是个未写入数据的文件，直接写入
+	if !file.Isfile {
+		signed_content, err := userdata.SYMSignContent(content, file.Symkey)
+		if err != nil {
+			return err
+		}
+		indexKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username + strconv.Itoa(file.Cur)))[:16])
+		if err != nil {
+			return err
+		}
+		userlib.DatastoreSet(indexKey, signed_content)
+		file.Isfile = true
+		if len(content) > LEASTBYTE {
+			file.Cur++
+			file.Isfile = false
+		}
+	} else {
+		// 已有数据但不满256byte，继续写入数据
+		indexKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username + strconv.Itoa(file.Cur)))[:16])
+		if err != nil {
+			return err
+		}
+		signed_content, ok := userlib.DatastoreGet(indexKey)
+		if !ok {
+			return errors.New(strings.ToTitle("file not found"))
+		}
+
+		plain_content, err := userdata.SYMDecodeContent(signed_content, file.Symkey)
+		if err != nil {
+			return err
+		}
+		plain_content = append(plain_content, content...)
+		signed_content, err = userdata.SYMSignContent(plain_content, file.Symkey)
+		if err != nil {
+			return err
+		}
+		userlib.DatastoreSet(indexKey, signed_content)
+		if len(plain_content) > LEASTBYTE {
+			file.Cur++
+			file.Isfile = false
+		}
+	}
+	signed_file, err := userdata.PKSignFile(file)
+	if err != nil {
+		return err
+	}
+	userlib.DatastoreSet(storageKey, signed_file)
+	return nil
+
 }
 
 func (userdata *User) LoadFile(filename string) (content []byte, err error) {
@@ -273,12 +398,36 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	dataJSON, ok := userlib.DatastoreGet(storageKey)
+	signed_content, ok := userlib.DatastoreGet(storageKey)
+	var file File
 	if !ok {
 		return nil, errors.New(strings.ToTitle("file not found"))
 	}
-	err = json.Unmarshal(dataJSON, &content)
-	return content, err
+	// rsa key pair
+	err = userdata.PKDecodeFile(signed_content, &file)
+	if err != nil {
+		return nil, err
+	}
+	chunk_num := file.Cur
+	if file.Isfile {
+		chunk_num++
+	}
+	for i := 0; i < chunk_num; i++ {
+		indexKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username + strconv.Itoa(i)))[:16])
+		if err != nil {
+			return nil, err
+		}
+		signed_content, ok := userlib.DatastoreGet(indexKey)
+		if !ok {
+			return nil, errors.New(strings.ToTitle("file not found"))
+		}
+		plain_content, err := userdata.SYMDecodeContent(signed_content, file.Symkey)
+		if err != nil {
+			return nil, err
+		}
+		content = append(content, plain_content...)
+	}
+	return content, nil
 }
 
 func (userdata *User) CreateInvitation(filename string, recipientUsername string) (
